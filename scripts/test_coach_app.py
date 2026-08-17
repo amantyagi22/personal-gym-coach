@@ -282,6 +282,24 @@ def test_stream_reports_every_step(tmp):
         srv.shutdown()
 
 
+
+def test_stale_export_is_stated_as_fact(tmp):
+    """The model has no clock: asked to judge staleness it guessed "1 day old" for a
+    six-week-old export. Freshness must be computed and stated, never inferred."""
+    from datetime import date, timedelta
+    old = date.today() - timedelta(days=42)
+    msg = app.data_freshness(f"(latest logged session: {old:%d %b %Y})")
+    assert "STALE" in msg, msg
+    assert "42 DAYS AGO" in msg, msg
+    assert f"{date.today():%d %b %Y}" in msg, "today's date must be stated"
+
+    fresh = date.today() - timedelta(days=2)
+    msg = app.data_freshness(f"(latest logged session: {fresh:%d %b %Y})")
+    assert "STALE" not in msg and "current" in msg, msg
+
+    assert "no dated sessions" in app.data_freshness("nothing here")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

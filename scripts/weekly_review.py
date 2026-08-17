@@ -45,6 +45,12 @@ MUSCLE_MAP = [
 ]
 
 
+# Small muscles are worked indirectly by presses and pulls, so they need fewer DIRECT
+# sets than a big muscle (notebook: 4-10 direct isolation sets).
+SMALL_MUSCLES = {"side delts", "rear delts", "front delts", "biceps", "triceps",
+                 "traps", "calves", "abs", "upper back"}
+
+
 def muscle_of(exercise):
     name = exercise.lower()
     for key, muscle in MUSCLE_MAP:
@@ -138,11 +144,18 @@ def main():
     print(f"Sessions: {len(cur_sess)} (prev week: {len(prev_sess)})")
     print(f"Working sets: {sum(cur_sets.values())} (prev week: {sum(prev_sets.values())})\n")
 
-    print("## Sets per muscle (this week vs last)")
+    # One number per muscle, labelled. The old layout put "4 sets ... 0 kg volume" on one
+    # line for bodyweight work, and a reader (human or model) picked up the wrong zero.
+    print("## Sets per muscle this week (target is 10-20 sets/week per muscle)")
     for m in sorted(set(cur_sets) | set(prev_sets), key=lambda x: -cur_sets.get(x, 0)):
         c, p = cur_sets.get(m, 0), prev_sets.get(m, 0)
-        arrow = "=" if c == p else ("up" if c > p else "down")
-        print(f"  {m:<12} {c:>3} sets  (prev {p:>3}, {arrow})  {cur_ton.get(m, 0):>7.0f} kg volume")
+        change = "same as last week" if c == p else f"last week {p} sets"
+        # Small muscles get direct isolation work on top of what presses/pulls already
+        # give them, so they need fewer direct sets than a big muscle. Flagging every
+        # muscle as low makes the flag meaningless.
+        floor = 6 if m in SMALL_MUSCLES else 10
+        flag = "  << LOW" if c < floor else ""
+        print(f"  {m:<12} {c:>3} sets this week ({change}){flag}")
 
     print("\n## Load progression (best working set, this week vs last)")
     for ex, (w, reps) in sorted(cur_top.items()):
@@ -186,6 +199,10 @@ def selftest():
     # Heavier top set wins at equal reps.
     _, _, _, top, _ = summarize([(d, "Squat", 60, 5), (d, "Squat", 80, 5)])
     assert top["Squat"] == (80, 5)
+    # Small muscles need fewer direct sets; flagging every muscle makes the flag useless.
+    assert "biceps" in SMALL_MUSCLES and "chest" not in SMALL_MUSCLES
+    assert "side delts" in SMALL_MUSCLES and "quads" not in SMALL_MUSCLES
+
     print("selftest ok")
 
 

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -224,8 +225,27 @@ def read_head(path, chars):
     return path.read_text()[:chars] if path.exists() else ""
 
 
+def data_freshness(summary):
+    """State the export's age as a fact. The model has no clock, so asked to judge
+    staleness it invents an answer ("only 1 day old" for a six-week-old export)."""
+    m = re.search(r"latest logged session: (\d{1,2} \w{3} \d{4})", summary)
+    if not m:
+        return "The training log has no dated sessions."
+    logged = datetime.strptime(m.group(1), "%d %b %Y").date()
+    days = (date.today() - logged).days
+    if days > 10:
+        return (f"TODAY IS {date.today():%d %b %Y}. The most recent logged session is "
+                f"{logged:%d %b %Y} - {days} DAYS AGO. THE EXPORT IS STALE: this is not "
+                f"recent training. Say so FIRST, before any analysis, and tell him to "
+                f"re-export from Strong (Settings -> Export Data).")
+    return (f"Today is {date.today():%d %b %Y}; the most recent logged session is "
+            f"{logged:%d %b %Y} ({days} days ago). The export is current.")
+
+
 def user_context():
-    parts = [f"THIS WEEK'S TRAINING DATA:\n{training_summary()}"]
+    summary = training_summary()
+    parts = [f"DATA FRESHNESS: {data_freshness(summary)}",
+             f"TRAINING DATA FROM THE LOG:\n{summary}"]
     proto = read_head(PROTOCOL, 3000)
     if proto:
         # The protocol is full of 📎 *Source: "..."* lines from when it was written. Left in,
@@ -285,15 +305,19 @@ def generate(messages):
 
 # ---------- the two flows ----------
 
-CHECKIN_KICKOFF = """Run Aman's weekly check-in.
+CHECKIN_KICKOFF = """Run Aman's weekly check-in. Write at most 60 words total.
 
-Step 1: In one or two sentences, name the single most important thing in this week's data - a \
-muscle under its target, a lift flat two weeks, a missed session, or a stale export (if the \
-latest logged session is over a week old, say so first).
-Step 2: Ask him ONE question - the most useful thing the data cannot tell you (sleep, stress, \
-joint pain, or which sets actually got near failure). Ask exactly one and then stop.
+First: if DATA FRESHNESS says the export is stale, say that and nothing else about the numbers - \
+old data is not this week's training. Otherwise name in ONE sentence the single most important \
+thing in the data: a muscle below the 10-20 sets/week target, a lift flat two weeks, or a missed \
+session. Use the actual set counts shown; do not guess at them, and do not comment on the date \
+yourself - DATA FRESHNESS already states it.
 
-Do not list all your questions. Do not give changes yet - those come after he answers."""
+Then: ask exactly ONE question - the most useful thing the data cannot tell you (sleep, stress, \
+joint pain, or which sets truly got near failure). ONE question mark in your whole reply.
+
+No changes or advice yet; those come after he answers. Do not label your reply with "Step 1" or \
+"Step 2"."""
 
 
 def build_messages(history, pack, user_msg, retrieval_query=None, step=None):

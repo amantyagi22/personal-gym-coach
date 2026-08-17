@@ -106,6 +106,8 @@ Everything under `private/` and `data/` is gitignored and never committed.
 
 | It says | Do this |
 |---|---|
+| `The coach is already running` | Nothing - just open http://localhost:8765. To restart: `pkill -f coach_app.py` first. |
+| `listen tcp 127.0.0.1:11434: bind: address already in use` | Ollama is **already running**. This is fine - carry on. |
 | `No knowledge pack at ...` | Run step 3. |
 | `Could not reach the model` | `ollama serve` isn't running. Start it. |
 | `AUTH EXPIRED` while building | Normal. `nlm login`, re-run — it resumes. |

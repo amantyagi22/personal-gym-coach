@@ -748,12 +748,27 @@ def main():
         return selftest()
     if BACKEND == "gemini":
         print(WARN)
+    # Bind BEFORE announcing: printing "Coach ready" and then dying on a taken port
+    # tells the user the opposite of what happened.
+    try:
+        server = HTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError as e:
+        if e.errno != 48:                      # EADDRINUSE
+            raise
+        sys.exit(f"The coach is already running at http://localhost:{PORT} — just open it.\n"
+                 f"(If you meant to restart it: pkill -f coach_app.py, then run this again.\n"
+                 f" To run a second copy on another port: COACH_PORT=8766 "
+                 f"python3 scripts/coach_app.py)")
+
     Handler.pack = Pack()
     print(f"Coach ready — http://localhost:{PORT}\n"
           f"  backend : {BACKEND} ({GEMINI_MODEL if BACKEND=='gemini' else CHAT_MODEL})\n"
           f"  cited   : {len(Handler.pack.entries)} topics, {len(Handler.pack.titles)} sources\n"
           f"  data    : {'strong_workouts.csv found' if (ROOT/'data/strong_workouts.csv').exists() else 'NO CSV'}")
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
 
 
 if __name__ == "__main__":

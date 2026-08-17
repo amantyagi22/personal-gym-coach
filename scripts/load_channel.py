@@ -13,6 +13,8 @@ import argparse
 import asyncio
 import json
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.request
@@ -145,8 +147,47 @@ def extract_videos(items: list) -> list[dict]:
     return videos
 
 
+def _yt_dlp_bin() -> str | None:
+    """Locate a yt-dlp binary (PATH or uv's ~/.local/bin)."""
+    from os.path import expanduser
+    return shutil.which("yt-dlp") or next(
+        (p for p in [expanduser("~/.local/bin/yt-dlp")] if shutil.os.path.exists(p)), None
+    )
+
+
+def scrape_via_yt_dlp(channel_url: str, ytdlp: str) -> list[dict]:
+    """Scrape a channel's full video list with yt-dlp (handles YouTube's paging/throttling)."""
+    videos_url = channel_url.rstrip("/")
+    if not videos_url.endswith("/videos"):
+        videos_url += "/videos"
+    out = subprocess.run(
+        [ytdlp, "--flat-playlist", "--print", "%(id)s\t%(title)s", videos_url],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    videos = []
+    for line in out.splitlines():
+        if "\t" not in line:
+            continue
+        vid_id, title = line.split("\t", 1)
+        if vid_id and title:
+            videos.append({"id": vid_id, "title": title, "length": "", "views": "",
+                           "published": "", "url": f"https://www.youtube.com/watch?v={vid_id}"})
+    print(f"Total: {len(videos)} videos", file=sys.stderr)
+    return videos
+
+
 def scrape_channel(channel_url: str) -> list[dict]:
-    """Scrape all videos from a YouTube channel."""
+    """Scrape all videos from a YouTube channel.
+
+    Prefer yt-dlp — YouTube now throttles the anonymous InnerTube WEB endpoint down to
+    ~2 videos with no continuation token. Fall back to InnerTube only if yt-dlp is absent.
+    """
+    ytdlp = _yt_dlp_bin()
+    if ytdlp:
+        return scrape_via_yt_dlp(channel_url, ytdlp)
+
+    print("yt-dlp not found; falling back to InnerTube (often returns a truncated list). "
+          "Install with: uv tool install yt-dlp", file=sys.stderr)
     channel_id = resolve_channel_id(channel_url)
     print(f"Channel ID: {channel_id}", file=sys.stderr)
 

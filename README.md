@@ -24,6 +24,10 @@ Coach: For most muscles the growth sweet spot is ~10–20 hard sets per week, an
 > interview, the auto-onboarding, the program builder. Works for any expert: swap the notebook id and
 > rewrite the persona (see [below](#use-it-for-a-different-expert)).
 
+> **Prefer your own chat app over a Claude Code session?** There's a local browser coach too —
+> chat plus a weekly check-in, running on Ollama so nothing leaves your machine.
+> See **[QUICKSTART.md](QUICKSTART.md)**.
+
 ## Why it's different
 
 - **Everything is cited — for real.** Every claim carries a source returned from the notebook *this

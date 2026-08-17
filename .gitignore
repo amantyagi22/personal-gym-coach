@@ -1,7 +1,8 @@
 # Personal data & generated plans — NEVER commit to this public repo
 /data/
-/private/
 /analysis/
+/private/
+/.lavish/
 *whoop*
 *.csv
 

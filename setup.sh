@@ -15,9 +15,10 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
-say "2/6  Installing the NotebookLM tools (nlm + notebooklm)…"
+say "2/6  Installing the NotebookLM tools (nlm + notebooklm) + yt-dlp…"
 uv tool install -q notebooklm-mcp-cli || true
 uv tool install -q "notebooklm-py[browser]" || true
+uv tool install -q yt-dlp || true  # channel scraper; InnerTube WEB endpoint is now throttled
 uvx --from "notebooklm-py[browser]" playwright install chromium >/dev/null 2>&1 || true
 export PATH="$HOME/.local/bin:$PATH"
 

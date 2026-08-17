@@ -38,6 +38,10 @@ PORT = int(os.environ.get("COACH_PORT", "8765"))
 TOP_K = 4
 # Bump when what we embed changes, so cached vectors are not reused.
 EMBED_SCHEME = "q-only-v2"
+# Cap output: length is the latency and the heat, not prompt size. Raise if replies
+# get cut off mid-sentence; COACH_THINK=1 restores qwen3 reasoning (slower).
+MAX_TOKENS = int(os.environ.get("COACH_MAX_TOKENS", "420"))
+THINK = os.environ.get("COACH_THINK", "") == "1"
 # Drop topics far below the best match: they are a different subject, and handing
 # them to the model invites it to answer from the wrong one.
 RELEVANCE_FLOOR = 0.62
@@ -66,7 +70,9 @@ WITHOUT any citation. Never invent a video title. Never cite Huberman, studies, 
 3. Coaching from Aman's constraints (his schedule, his joints, his numbers) needs no citation - \
 just never dress it up as Jeff's view.
 4. Aman's RPE column is blank, so effort is ALWAYS inferred, never measured. Say so when it matters.
-5. Be concise and direct. Answer in a few short paragraphs. Give at most three concrete changes.
+5. BE SHORT. Answer in AT MOST 150 words. Lead with the answer in one sentence, then at most \
+three short bullets. No preamble, no restating the question, no closing summary, no "in \
+conclusion". A long answer is a worse answer. Give at most three concrete changes.
 Weights are kg."""
 
 WARN = """
@@ -244,9 +250,14 @@ def user_context():
 # ---------- model backends ----------
 
 def call_ollama(messages):
+    # Measured: unconstrained, qwen3:8b wrote 1,735 tokens (~108s) for an answer that
+    # needs ~250. Generation length IS the latency and the heat - prompt processing was
+    # only 1,272 tokens. think=False skips the reasoning pass we strip anyway.
     return post_json(f"{OLLAMA}/api/chat",
                      {"model": CHAT_MODEL, "messages": messages, "stream": False,
-                      "options": {"temperature": 0.4}})["message"]["content"]
+                      "think": THINK,
+                      "options": {"temperature": 0.4,
+                                  "num_predict": MAX_TOKENS}})["message"]["content"]
 
 
 def call_gemini(messages):

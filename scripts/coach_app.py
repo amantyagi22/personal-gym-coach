@@ -36,6 +36,12 @@ BACKEND = os.environ.get("COACH_BACKEND", "ollama").lower()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 PORT = int(os.environ.get("COACH_PORT", "8765"))
 TOP_K = 4
+# Bump when what we embed changes, so cached vectors are not reused.
+EMBED_SCHEME = "q-only-v2"
+# Drop topics far below the best match: they are a different subject, and handing
+# them to the model invites it to answer from the wrong one.
+RELEVANCE_FLOOR = 0.62
+RELEVANCE_MARGIN = 0.12
 
 # Personal targets stay out of the repo. Set COACH_NUTRITION, or drop a line in
 # private/nutrition.txt (gitignored), e.g. "2200 kcal/day, 185 g protein".
@@ -51,9 +57,12 @@ ABSOLUTE RULES:
 [[Exact Title]] using the title exactly as given - double square brackets, nothing else. Do NOT \
 write sources as *"Title"* or "Title" or a Source: list; that format is rejected and deleted. Do \
 NOT copy source titles out of his protocol document below - only titles from CITED SOURCES exist.
-2. If the sources do not cover the question, say plainly: "The notebook doesn't cover this \
-directly" and then coach from Aman's own data and constraints WITHOUT any citation. Never invent \
-a video title. Never cite Huberman, studies, or other experts.
+2. The block marked "THE ANSWER TO THIS QUESTION IS BELOW" contains the notebook's actual \
+researched answer. USE IT. Give its specific numbers and recommendations directly - do not say \
+the sources "do not explicitly state" something that is written there, and NEVER write phrases \
+like "outside the provided texts" or fall back on your own training knowledge. If it genuinely \
+is not covered, say "The notebook doesn't cover this directly" and coach from Aman's own data \
+WITHOUT any citation. Never invent a video title. Never cite Huberman, studies, or other experts.
 3. Coaching from Aman's constraints (his schedule, his joints, his numbers) needs no citation - \
 just never dress it up as Jeff's view.
 4. Aman's RPE column is blank, so effort is ALWAYS inferred, never measured. Say so when it matters.
@@ -108,29 +117,52 @@ class Pack:
         key = [e["question"] for e in self.entries]
         if cache.exists():
             c = json.loads(cache.read_text())
-            if c.get("questions") == key and c.get("model") == EMBED_MODEL:
+            # scheme bumps when what we embed changes, so stale vectors aren't reused
+            if (c.get("questions") == key and c.get("model") == EMBED_MODEL
+                    and c.get("scheme") == EMBED_SCHEME):
                 return c["vectors"]
         print(f"Embedding {len(self.entries)} pack entries with {EMBED_MODEL} (one time)...")
-        vecs = [embed(f"{e['topic']}: {e['question']}\n{e['answer'][:1500]}")
-                for e in self.entries]
+        # Question only: the long answer text dilutes the topic signal and measurably
+        # lowers similarity against a user's short question.
+        vecs = [embed(f"{e['topic']}: {e['question']}") for e in self.entries]
         cache.write_text(json.dumps(
-            {"questions": key, "model": EMBED_MODEL, "vectors": vecs}))
+            {"questions": key, "model": EMBED_MODEL, "scheme": EMBED_SCHEME, "vectors": vecs}))
         return vecs
 
     def search(self, query, k=TOP_K):
         qv = embed(query)
-        ranked = sorted(zip(self.entries, self.vectors),
-                        key=lambda p: cosine(qv, p[1]), reverse=True)
-        return [e for e, _ in ranked[:k]]
+        ranked = sorted(((cosine(qv, v), e) for e, v in zip(self.entries, self.vectors)),
+                        key=lambda p: p[0], reverse=True)
+        best = ranked[0][0]
+        # Only keep topics close to the best match. A 0.62 hit against a 0.89 best is a
+        # different subject, and including it invites the model to answer from it -
+        # which is how "best side delt exercises" got answered with Meadows rows.
+        keep = [e for score, e in ranked[:k]
+                if score >= max(RELEVANCE_FLOOR, best - RELEVANCE_MARGIN)]
+        return keep or [ranked[0][1]]
 
 
 def sources_block(entries):
+    """Keep this SMALL. A 5k-token prompt makes qwen3:8b lose the answer that's sitting
+    right in front of it and fall back on its own memory - the exact failure this app
+    exists to prevent. The top topic carries the answer; the rest are context at most."""
     out = []
-    for e in entries:
-        for s in e["sources"]:
-            if s.get("cited_text"):
-                out.append(f'[[{s["title"]}]]\n"{s["cited_text"][:600]}"')
-    return "\n\n".join(out) if out else "(no relevant sources found)"
+    for rank, e in enumerate(entries):
+        if rank == 0:
+            block = [f"THE ANSWER TO THIS QUESTION IS BELOW.\nTopic: {e['question']}\n"
+                     f"{e['answer'][:2200]}"]
+            titles = [s["title"] for s in e["sources"] if s.get("cited_text")][:4]
+            if titles:
+                block.append("Cite these for the claims above:\n"
+                             + "\n".join(f"[[{t}]]" for t in titles))
+        else:
+            # Supporting topics: headline only. Full answers here crowd out the real one.
+            block = [f"(also relevant) {e['question']}\n{e['answer'][:400]}"]
+            t = next((s["title"] for s in e["sources"] if s.get("cited_text")), None)
+            if t:
+                block.append(f"[[{t}]]")
+        out.append("\n".join(block))
+    return "\n\n---\n\n".join(out) if out else "(no relevant sources found)"
 
 
 # ---------- citation enforcement ----------
@@ -253,11 +285,27 @@ joint pain, or which sets actually got near failure). Ask exactly one and then s
 Do not list all your questions. Do not give changes yet - those come after he answers."""
 
 
-def build_messages(history, pack, user_msg, retrieval_query=None):
+def build_messages(history, pack, user_msg, retrieval_query=None, step=None):
+    """step(name, status, detail) reports pipeline progress to the caller, if given."""
+    def report(*a):
+        if step:
+            step(*a)
+
+    report("retrieve", "run", "embedding your question")
     hits = pack.search(retrieval_query or user_msg)
+    titles = [s["title"] for e in hits for s in e["sources"] if s.get("cited_text")]
+    report("retrieve", "ok",
+           f"{len(hits)} topics · {len(set(titles))} sources")
+
+    report("data", "run", "reading your training log")
+    ctx = user_context()
+    sessions = re.search(r"Sessions: (\d+)", ctx)
+    sets = re.search(r"Working sets: (\d+)", ctx)
+    report("data", "ok", (f"{sessions.group(1)} sessions · {sets.group(1)} sets"
+                          if sessions and sets else "context loaded"))
     # Sources go LAST, nearest the question: a small model answers from whatever is most
     # recent and confident in its context, and the protocol excerpt otherwise wins.
-    system = (f"{SYSTEM}\n\n=== AMAN'S DATA ===\n{user_context()}\n\n"
+    system = (f"{SYSTEM}\n\n=== AMAN'S DATA ===\n{ctx}\n\n"
               f"=== CITED SOURCES — the ONLY citable material, and where your answer "
               f"must come from ===\n{sources_block(hits)}\n\n"
               f"Answer the question using the CITED SOURCES above. Cite each Jeff claim as "
@@ -270,68 +318,192 @@ def build_messages(history, pack, user_msg, retrieval_query=None):
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Coach</title><style>
-:root{--bg:#faf9f7;--fg:#1a1a1a;--mut:#6b6b6b;--card:#fff;--line:#e5e3df;--acc:#b4532a}
-@media(prefers-color-scheme:dark){:root{--bg:#1a1917;--fg:#eceae6;--mut:#9a978f;--card:#252320;--line:#38352f;--acc:#e0794a}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:16px/1.6 -apple-system,system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
-header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
-justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-h1{font-size:16px;margin:0;font-weight:600}
-.meta{font-size:12px;color:var(--mut)}
-button{font:inherit;font-size:14px;padding:8px 14px;border-radius:8px;border:1px solid var(--line);
-background:var(--card);color:var(--fg);cursor:pointer}
+:root{--bg:#f7f6f3;--fg:#22201d;--mut:#77736c;--card:#fff;--line:#e4e1db;--acc:#c2410c;
+--acc-soft:#fdf0e7;--shadow:0 1px 3px rgba(0,0,0,.06),0 4px 16px rgba(0,0,0,.04)}
+@media(prefers-color-scheme:dark){:root{--bg:#171614;--fg:#eae7e2;--mut:#9d9891;--card:#211f1c;
+--line:#332f2a;--acc:#fb923c;--acc-soft:#2a1d13;--shadow:0 1px 3px rgba(0,0,0,.3)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:16px/1.65 ui-sans-serif,-apple-system,system-ui,sans-serif;
+display:flex;flex-direction:column;height:100vh;-webkit-font-smoothing:antialiased}
+header{padding:12px 22px;border-bottom:1px solid var(--line);display:flex;
+justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;background:var(--card)}
+h1{font-size:15px;margin:0;font-weight:650;letter-spacing:-.01em}
+.meta{font-size:12px;color:var(--mut);margin-top:1px}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#16a34a;margin-right:5px}
+button{font:inherit;font-size:13.5px;font-weight:500;padding:8px 15px;border-radius:9px;
+border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;
+transition:all .15s}
+button:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
 button.primary{background:var(--acc);color:#fff;border-color:var(--acc)}
-button:disabled{opacity:.5;cursor:default}
-#log{flex:1;overflow-y:auto;padding:20px;max-width:820px;width:100%;margin:0 auto}
-.msg{margin-bottom:18px;white-space:pre-wrap;overflow-wrap:anywhere}
-.msg.user{text-align:right}.msg.user span{background:var(--acc);color:#fff;padding:9px 13px;
-border-radius:13px;display:inline-block;text-align:left;max-width:85%}
-.cite{display:block;margin:9px 0;padding:9px 13px;border-left:3px solid var(--acc);
-background:var(--card);border-radius:0 8px 8px 0;font-size:14px}
-.cite b{display:block;font-size:12px;color:var(--acc);margin-bottom:3px}
-.cite i{color:var(--mut)}
-form{display:flex;gap:9px;padding:14px 20px;border-top:1px solid var(--line);
-max-width:820px;width:100%;margin:0 auto}
-input{flex:1;font:inherit;padding:11px 14px;border-radius:9px;border:1px solid var(--line);
-background:var(--card);color:var(--fg)}
-.warn{background:#8a2f14;color:#fff;padding:7px 20px;font-size:13px}
+button.primary:hover:not(:disabled){opacity:.88;color:#fff}
+button:disabled{opacity:.45;cursor:default}
+#log{flex:1;overflow-y:auto;padding:26px 22px;max-width:780px;width:100%;margin:0 auto}
+.msg{margin-bottom:22px;overflow-wrap:anywhere}
+.msg.user{display:flex;justify-content:flex-end}
+.msg.user span{background:var(--acc);color:#fff;padding:9px 14px;border-radius:15px 15px 4px 15px;
+max-width:82%;line-height:1.5}
+.msg.bot{animation:fade .25s ease}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+.msg.bot p{margin:0 0 11px}
+.msg.bot ul,.msg.bot ol{margin:0 0 11px;padding-left:22px}
+.msg.bot li{margin:3px 0}
+.msg.bot strong{font-weight:640}
+.msg.bot h3{font-size:15px;margin:16px 0 7px;font-weight:640}
+.msg.bot code{background:var(--acc-soft);padding:1px 5px;border-radius:4px;font-size:.9em}
+/* Inline chip: a citation belongs INSIDE the sentence it supports, not as a block
+   that guillotines the paragraph in half. */
+.cite{display:inline-flex;align-items:center;gap:4px;background:var(--acc-soft);
+color:var(--acc);border:1px solid transparent;border-radius:20px;padding:1px 9px;
+font-size:12px;font-weight:520;line-height:1.7;cursor:default;vertical-align:baseline;
+max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cite::before{content:"📎";font-size:10px}
+.cite:hover{border-color:var(--acc);max-width:none;white-space:normal}
+/* Pipeline panel: what's actually running, live. */
+.steps{border:1px solid var(--line);border-radius:11px;background:var(--card);
+padding:5px 0;margin-bottom:12px;font-size:13.5px;box-shadow:var(--shadow);overflow:hidden}
+.steps.done{opacity:.62}
+.steps summary{list-style:none;cursor:pointer;padding:6px 14px;color:var(--mut);
+font-size:12.5px;display:flex;align-items:center;gap:7px;font-weight:500}
+.steps summary::-webkit-details-marker{display:none}
+.steps summary b{color:var(--fg);font-weight:600}
+.step{display:flex;align-items:center;gap:10px;padding:5px 15px}
+.step .ic{width:16px;height:16px;flex:0 0 16px;display:grid;place-items:center;
+border-radius:50%;font-size:10px;font-weight:700}
+.step.run .ic{border:1.7px solid var(--acc);border-top-color:transparent;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.step.ok .ic{background:#16a34a;color:#fff}
+.step.warn .ic{background:#d97706;color:#fff}
+.step.err .ic{background:#dc2626;color:#fff}
+.step.wait .ic{border:1.7px solid var(--line)}
+.step .nm{font-weight:530;min-width:74px}
+.step.wait .nm,.step.wait .dt{color:var(--mut);opacity:.6}
+.step .dt{color:var(--mut);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.typing{display:inline-flex;gap:4px;padding:4px 0}
+.typing i{width:6px;height:6px;border-radius:50%;background:var(--mut);animation:bounce 1.2s infinite}
+.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
+@keyframes bounce{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-4px)}}
+.stripped{font-size:12px;color:var(--mut);margin-top:9px;font-style:italic}
+.savebtn{font-size:12px;padding:4px 11px;margin-top:10px;border-radius:7px}
+.empty{text-align:center;color:var(--mut);margin-top:16vh;line-height:1.9}
+.empty b{display:block;color:var(--fg);font-size:17px;font-weight:600;margin-bottom:6px}
+.chip{display:inline-block;background:var(--card);border:1px solid var(--line);border-radius:16px;
+padding:6px 13px;margin:4px 3px;font-size:13px;cursor:pointer;transition:all .15s}
+.chip:hover{border-color:var(--acc);color:var(--acc)}
+form{display:flex;gap:9px;padding:14px 22px 18px;border-top:1px solid var(--line);
+max-width:780px;width:100%;margin:0 auto;background:var(--bg)}
+input{flex:1;font:inherit;font-size:15px;padding:12px 16px;border-radius:11px;
+border:1px solid var(--line);background:var(--card);color:var(--fg);outline:none;transition:.15s}
+input:focus{border-color:var(--acc)}
+.warn{background:#9a3412;color:#fff;padding:8px 22px;font-size:13px}
 </style></head><body>
 <header><div><h1>Personal Coach</h1><div class="meta" id="meta"></div></div>
-<button id="checkin">Start weekly check-in</button></header>
+<button id="checkin">Weekly check-in</button></header>
 <div id="warn"></div><div id="log"></div>
 <form id="f"><input id="q" placeholder="Ask anything - training, the cut, an aching elbow..."
 autocomplete="off"><button class="primary" id="send">Send</button></form>
 <script>
 const log=document.getElementById('log'),q=document.getElementById('q'),f=document.getElementById('f');
+const STARTERS=["How many sets per muscle per week?","How close to failure should I train?",
+  "How much protein while cutting?","Best exercises for side delts?"];
 fetch('/info').then(r=>r.json()).then(d=>{
-  document.getElementById('meta').textContent=`${d.backend} · ${d.model} · ${d.entries} cited topics`;
+  document.getElementById('meta').innerHTML=
+    `<span class="dot"></span>${d.backend} · ${d.model} · ${d.entries} cited topics`;
   if(d.backend==='gemini')document.getElementById('warn').innerHTML=
     '<div class="warn">Gemini mode: your data goes to Google and free-tier prompts are used for training.</div>';
+  log.innerHTML=`<div class="empty" id="empty"><b>What do you want to work on?</b>
+    Grounded in ${d.entries} cited topics from your notebook.<br><br>`+
+    STARTERS.map(s=>`<span class="chip">${s}</span>`).join('')+`</div>`;
+  document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>send(c.textContent));
 });
 function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
-function render(t){return esc(t).replace(/\\[\\[([^\\]]+)\\]\\]/g,
-  (m,x)=>`<span class="cite"><b>Source</b>${x}</span>`)}
-function add(role,text){const d=document.createElement('div');d.className='msg '+role;
-  d.innerHTML=role==='user'?`<span>${esc(text)}</span>`:render(text);
+// Minimal markdown: the model writes **bold**, ### headings and - lists, and raw
+// asterisks on screen look broken. Not a full parser - just what actually shows up.
+function render(t){
+  let h=esc(t)
+    .replace(/\\[\\[([^\\]]+)\\]\\]/g,(m,x)=>`<span class="cite" title="${x}">${x}</span>`)
+    .replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/^###\\s*(.+)$/gm,'<h3>$1</h3>')
+    .replace(/^\\s*[-*]\\s+(.+)$/gm,'<li>$1</li>')
+    .replace(/^\\s*(\\d+)\\.\\s+(.+)$/gm,'<li>$2</li>');
+  h=h.replace(/(<li>[\\s\\S]*?<\\/li>)(?!\\s*<li>)/g,'<ul>$1</ul>');
+  // Split into blocks, then wrap only the loose prose. A heading followed by text on
+  // the next line must not swallow that text into the heading block.
+  return h.split(/\\n{2,}/).map(b=>b.split(/(<\\/h3>|<\\/ul>)/).map(part=>{
+    if(!part.trim()||/^(<\\/h3>|<\\/ul>)$/.test(part))return part;
+    if(/^\\s*<(ul|h3)/.test(part))return part;
+    return `<p>${part.trim().replace(/\\n/g,'<br>')}</p>`;
+  }).join('')).join('');
+}
+function add(role,text,raw){const e=document.getElementById('empty');if(e)e.remove();
+  const d=document.createElement('div');d.className='msg '+role;
+  d.innerHTML=role==='user'?`<span>${esc(text)}</span>`
+    :(raw?text:render(text));
   log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
 function addSave(el,text){const b=document.createElement('button');
-  b.textContent='Save to weekly log';b.style.cssText='font-size:12px;padding:4px 9px;margin-top:8px';
+  b.textContent='Save to weekly log';b.className='savebtn';
   b.onclick=async()=>{b.disabled=true;
     const r=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({text})});
     b.textContent=(await r.json()).saved?'Saved to weekly-log.md':'Save failed';};
   el.appendChild(document.createElement('br'));el.appendChild(b)}
+// The pipeline, in the order it runs. Shown up-front as pending so you can see
+// what's coming, not just what's finished.
+const STEPS=[["retrieve","Retrieve","find cited passages"],
+             ["data","Your data","training log + program"],
+             ["generate","Generate","write the coaching"],
+             ["verify","Verify","check every source title"]];
+const ICON={ok:"✓",warn:"!",err:"×",run:"",wait:""};
+function stepPanel(){
+  const d=document.createElement('details');d.className='steps';d.open=true;
+  d.innerHTML=`<summary><b>Working</b><span id="sm"></span></summary>`+
+    STEPS.map(([k,n,h])=>`<div class="step wait" data-k="${k}">
+      <span class="ic"></span><span class="nm">${n}</span><span class="dt">${h}</span></div>`).join('');
+  return d;
+}
+function setStep(panel,name,status,detail){
+  const el=panel.querySelector(`[data-k="${name}"]`);if(!el)return;
+  el.className='step '+status;
+  el.querySelector('.ic').textContent=ICON[status]||'';
+  if(detail)el.querySelector('.dt').textContent=detail;
+}
 async function send(text,mode){
   if(text)add('user',text);
-  const wait=add('bot','...');q.value='';q.disabled=true;
+  const holder=add('bot','',true);
+  const panel=stepPanel();holder.appendChild(panel);
+  const body=document.createElement('div');holder.appendChild(body);
+  body.innerHTML='<div class="typing"><i></i><i></i><i></i></div>';
+  q.value='';q.disabled=true;
   document.getElementById('send').disabled=true;document.getElementById('checkin').disabled=true;
-  try{const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message:text,mode:mode||'chat'})});
-    const d=await r.json();wait.innerHTML=render(d.reply);
-    if(d.stripped&&d.stripped.length)wait.innerHTML+=
-      `<div class="cite"><b>removed</b><i>${d.stripped.length} invented source title(s) stripped</i></div>`;
-    addSave(wait,d.reply);
-  }catch(e){wait.textContent='Error: '+e.message}
+  const t0=Date.now();
+  try{
+    const r=await fetch('/chat-stream',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:text,mode:mode||'chat'})});
+    const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
+    for(;;){const {value,done}=await rd.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const parts=buf.split('\\n\\n');buf=parts.pop();
+      for(const p of parts){
+        if(!p.startsWith('data: '))continue;
+        const d=JSON.parse(p.slice(6));
+        if(d.event==='step'){setStep(panel,d.name,d.status,d.detail);
+          log.scrollTop=log.scrollHeight;}
+        else if(d.event==='done'){
+          body.innerHTML=render(d.reply);
+          if(d.stripped&&d.stripped.length)body.innerHTML+=
+            `<div class="stripped">${d.stripped.length} invented source title(s) removed</div>`;
+          addSave(body,d.reply);
+          panel.open=false;panel.classList.add('done');
+          const secs=((Date.now()-t0)/1000).toFixed(1);
+          panel.querySelector('summary b').textContent='4 steps';
+          document.getElementById('sm').textContent=` · ${secs}s`;
+          panel.querySelector('#sm').removeAttribute('id');
+        }
+      }
+    }
+  }catch(e){body.innerHTML=`<p>Error: ${esc(e.message)}</p>`}
   q.disabled=false;document.getElementById('send').disabled=false;
   document.getElementById('checkin').disabled=false;q.focus();log.scrollTop=log.scrollHeight;
 }
@@ -345,11 +517,15 @@ class Handler(BaseHTTPRequestHandler):
     pack = None
     history = []
 
-    def _send(self, code, body, ctype="application/json"):
+    # The page is a single inline string that changes whenever the app is edited. Without
+    # this, the browser serves a cached copy and you debug an answer the server never sent.
+    def _send(self, code, body, ctype="application/json", no_cache=True):
         b = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
+        if no_cache:
+            self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(b)
 
@@ -374,11 +550,13 @@ class Handler(BaseHTTPRequestHandler):
             append_log(entry)
             print(f"  appended {len(entry)} chars to {LOG}")
             return self._send(200, json.dumps({"saved": True, "path": str(LOG)}))
-        if self.path != "/chat":
+        if self.path not in ("/chat", "/chat-stream"):
             return self._send(404, "not found", "text/plain")
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n) or "{}")
         mode, msg = req.get("mode", "chat"), (req.get("message") or "").strip()
+        if self.path == "/chat-stream":
+            return self.stream_chat(mode, msg)
         if mode == "checkin":
             # Start the ritual on a clean thread so prior chat doesn't bleed into it,
             # but keep answering it as normal chat afterwards.
@@ -404,6 +582,59 @@ class Handler(BaseHTTPRequestHandler):
         if stripped:
             print(f"  stripped invented citations: {stripped}")
         self._send(200, json.dumps({"reply": reply, "stripped": stripped}))
+
+    def stream_chat(self, mode, msg):
+        """Same pipeline as /chat, but each step is pushed to the browser as it happens,
+        so a 90-second local generation isn't a blank wait."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        def emit(event, **data):
+            try:
+                self.wfile.write(f"data: {json.dumps({'event': event, **data})}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                raise                      # browser navigated away; abandon the request
+
+        if mode == "checkin":
+            Handler.history = []
+            msg, retrieval_query = CHECKIN_KICKOFF, \
+                "weekly review volume progression recovery cut adherence"
+        elif msg:
+            retrieval_query = msg
+        else:
+            return emit("done", reply="Empty message.", stripped=[])
+
+        try:
+            step = lambda name, status, detail="": emit(
+                "step", name=name, status=status, detail=detail)
+            messages = build_messages(Handler.history, self.pack, msg,
+                                      retrieval_query, step=step)
+            backend = GEMINI_MODEL if BACKEND == "gemini" else CHAT_MODEL
+            emit("step", name="generate", status="run", detail=f"{backend} is writing")
+            raw = generate(messages)
+            emit("step", name="generate", status="ok",
+                 detail=f"{len(raw.split())} words")
+
+            emit("step", name="verify", status="run", detail="checking every source title")
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
+            reply, stripped = strip_fake_citations(raw, self.pack.titles)
+            cited = len(set(re.findall(r"\[\[([^\]]+)\]\]", reply)))
+            emit("step", name="verify", status="warn" if stripped else "ok",
+                 detail=(f"{len(stripped)} invented removed" if stripped
+                         else f"{cited} source(s) verified" if cited else "no claims cited"))
+
+            Handler.history = Handler.history[-6:] + [
+                {"role": "user", "content": msg}, {"role": "assistant", "content": reply}]
+            if stripped:
+                print(f"  stripped invented citations: {stripped}")
+            emit("done", reply=reply, stripped=stripped)
+        except (urllib.error.URLError, OSError) as e:
+            emit("step", name="generate", status="err", detail=str(e)[:60])
+            emit("done", reply=f"Could not reach the model ({e}). Is `ollama serve` running?",
+                 stripped=[])
 
     def log_message(self, *a):
         pass

@@ -217,6 +217,71 @@ def test_extraction_checkpoint_survives(tmp):
     assert len(build_pack.load()["entries"]) == 1
 
 
+
+# ---- frontend rendering (runs only if node is available) ----
+
+def test_markdown_and_inline_citations(tmp):
+    """The reply must render as prose with citations INSIDE sentences, not blocks
+    that guillotine a paragraph in half, and no raw ** asterisks on screen."""
+    import shutil, subprocess
+    if not shutil.which("node"):
+        print("  skip node-dependent render test (node not installed)")
+        return
+    js = app.PAGE.split("<script>", 1)[1].split("</script>")[0]
+    harness = js[js.index("function esc"):js.index("function add(")] + """
+console.log(JSON.stringify({
+  inline: render("Train at **1-3 RIR** [[T]] now."),
+  heading: render("### Head\\nBody text."),
+  list: render("- one\\n- two"),
+}));
+"""
+    f = Path(tmp) / "r.js"
+    f.write_text(harness)
+    out = subprocess.run(["node", str(f)], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr[:400]
+    r = json.loads(out.stdout)
+    # citation stays inline inside the sentence
+    assert "<p>Train at <strong>1-3 RIR</strong>" in r["inline"], r["inline"]
+    assert 'class="cite"' in r["inline"] and "now.</p>" in r["inline"], r["inline"]
+    assert "**" not in r["inline"], "raw asterisks must not reach the screen"
+    # text after a heading must be wrapped, not left loose
+    assert "<h3>Head</h3>" in r["heading"] and "<p>Body text.</p>" in r["heading"], r["heading"]
+    assert "<ul><li>one</li>" in r["list"], r["list"]
+
+
+
+def test_stream_reports_every_step(tmp):
+    """The stream must announce each pipeline stage, then deliver the reply."""
+    srv, url, _, _ = start_server(f"Answer [[{REAL_TITLE}]] and [[Made Up Title]].", tmp)
+    try:
+        req = urllib.request.Request(url + "/chat-stream",
+                                     data=json.dumps({"message": "how hard?"}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        events = []
+        with urllib.request.urlopen(req, timeout=20) as r:
+            for line in r:
+                line = line.decode().strip()
+                if line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
+        steps = [e for e in events if e["event"] == "step"]
+        names = {s["name"] for s in steps}
+        assert names == {"retrieve", "data", "generate", "verify"}, names
+        # every step must both start and finish
+        for n in names:
+            sts = [s["status"] for s in steps if s["name"] == n]
+            assert sts[0] == "run", (n, sts)
+            assert sts[-1] in ("ok", "warn", "err"), (n, sts)
+        # a stripped citation must surface as a warning, not a silent pass
+        verify = [s for s in steps if s["name"] == "verify"][-1]
+        assert verify["status"] == "warn", verify
+        done = events[-1]
+        assert done["event"] == "done"
+        assert REAL_TITLE in done["reply"]
+        assert done["stripped"] == ["Made Up Title"], done["stripped"]
+    finally:
+        srv.shutdown()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

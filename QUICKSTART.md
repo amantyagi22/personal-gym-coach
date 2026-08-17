@@ -74,6 +74,33 @@ Open **http://localhost:8765**
 
 ---
 
+## Use it from your phone
+
+The coach is already a web page, so your phone doesn't need an app - just make the
+server reachable on your WiFi:
+
+```bash
+COACH_LAN=1 python3 scripts/coach_app.py
+```
+
+It prints the address to use, e.g. `PHONE : http://192.168.31.197:8765`.
+Open that in Safari or Chrome on your phone, then **Share → Add to Home Screen**.
+It gets an icon and opens fullscreen with no browser chrome - it behaves like an
+installed app without being one.
+
+**What this means, plainly:** while `COACH_LAN=1` is set, anyone on the same WiFi
+can open your coach and read your training log, body stats and injuries. There's no
+password. Fine on your home network; don't do it on cafe or gym WiFi. Without the
+flag the server stays on loopback and only this Mac can reach it.
+
+It only works while the laptop is on, awake, and on the same network - the model
+runs there. A sleeping Mac means no coach. (`caffeinate -s` keeps it awake while
+you're using it.)
+
+Away from home? Install [Tailscale](https://tailscale.com) on both devices - your
+phone and Mac then see each other from anywhere over an encrypted private network,
+with nothing exposed to the public internet.
+
 ## Your numbers
 
 Put your current calorie and protein targets in `private/nutrition.txt` (gitignored, one line):

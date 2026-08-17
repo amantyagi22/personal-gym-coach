@@ -36,6 +36,10 @@ EMBED_MODEL = os.environ.get("COACH_EMBED_MODEL", "nomic-embed-text")
 BACKEND = os.environ.get("COACH_BACKEND", "ollama").lower()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 PORT = int(os.environ.get("COACH_PORT", "8765"))
+# Loopback by default: the coach carries body stats, injuries and a training log, so it
+# is not on the network unless asked. COACH_LAN=1 binds all interfaces so a phone on the
+# same WiFi can reach it - which also means everyone else on that WiFi can.
+HOST = "0.0.0.0" if os.environ.get("COACH_LAN") == "1" else "127.0.0.1"
 TOP_K = 4
 # Bump when what we embed changes, so cached vectors are not reused.
 EMBED_SCHEME = "q-only-v2"
@@ -366,7 +370,16 @@ def build_messages(history, pack, user_msg, retrieval_query=None, step=None):
 # ---------- web ----------
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Coach</title><style>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Coach</title>
+<!-- "Add to Home Screen" on iOS: opens fullscreen with no browser chrome, so it
+     behaves like an installed app without any of it being one. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Coach">
+<meta name="theme-color" content="#171614">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' fill='%23171614'/%3E%3Ctext x='90' y='125' font-size='105' text-anchor='middle'%3E%F0%9F%8F%8B%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<style>
 :root{--bg:#f7f6f3;--fg:#22201d;--mut:#77736c;--card:#fff;--line:#e4e1db;--acc:#c2410c;
 --acc-soft:#fdf0e7;--shadow:0 1px 3px rgba(0,0,0,.06),0 4px 16px rgba(0,0,0,.04)}
 @media(prefers-color-scheme:dark){:root{--bg:#171614;--fg:#eae7e2;--mut:#9d9891;--card:#211f1c;
@@ -374,7 +387,10 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
 font:16px/1.65 ui-sans-serif,-apple-system,system-ui,sans-serif;
-display:flex;flex-direction:column;height:100vh;-webkit-font-smoothing:antialiased}
+display:flex;flex-direction:column;-webkit-font-smoothing:antialiased;
+/* dvh follows the on-screen keyboard; vh does not, so the input hides behind it */
+height:100vh;height:100dvh;
+padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
 header{padding:12px 22px;border-bottom:1px solid var(--line);display:flex;
 justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;background:var(--card)}
 h1{font-size:15px;margin:0;font-weight:650;letter-spacing:-.01em}
@@ -441,7 +457,8 @@ padding:6px 13px;margin:4px 3px;font-size:13px;cursor:pointer;transition:all .15
 .chip:hover{border-color:var(--acc);color:var(--acc)}
 form{display:flex;gap:9px;padding:14px 22px 18px;border-top:1px solid var(--line);
 max-width:780px;width:100%;margin:0 auto;background:var(--bg)}
-input{flex:1;font:inherit;font-size:15px;padding:12px 16px;border-radius:11px;
+/* 16px minimum: iOS auto-zooms the page when you focus a smaller input */
+input{flex:1;font:inherit;font-size:16px;padding:12px 16px;border-radius:11px;
 border:1px solid var(--line);background:var(--card);color:var(--fg);outline:none;transition:.15s}
 input:focus{border-color:var(--acc)}
 .warn{background:#9a3412;color:#fff;padding:8px 22px;font-size:13px}
@@ -743,6 +760,20 @@ def selftest():
     print("selftest ok")
 
 
+def lan_ip():
+    """This Mac's address on the WiFi. No packets are sent - connect() on a UDP socket
+    just picks the interface the OS would route through."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 80))   # TEST-NET-1, never actually routed
+        return s.getsockname()[0]
+    except OSError:
+        return "your-mac-ip"
+    finally:
+        s.close()
+
+
 def main():
     if "--selftest" in sys.argv:
         return selftest()
@@ -751,7 +782,7 @@ def main():
     # Bind BEFORE announcing: printing "Coach ready" and then dying on a taken port
     # tells the user the opposite of what happened.
     try:
-        server = HTTPServer(("127.0.0.1", PORT), Handler)
+        server = HTTPServer((HOST, PORT), Handler)
     except OSError as e:
         if e.errno != 48:                      # EADDRINUSE
             raise
@@ -765,6 +796,9 @@ def main():
           f"  backend : {BACKEND} ({GEMINI_MODEL if BACKEND=='gemini' else CHAT_MODEL})\n"
           f"  cited   : {len(Handler.pack.entries)} topics, {len(Handler.pack.titles)} sources\n"
           f"  data    : {'strong_workouts.csv found' if (ROOT/'data/strong_workouts.csv').exists() else 'NO CSV'}")
+    if HOST == "0.0.0.0":
+        print(f"  PHONE   : http://{lan_ip()}:{PORT}  (same WiFi; anyone on this "
+              f"network can reach it)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

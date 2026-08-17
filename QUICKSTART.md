@@ -111,14 +111,40 @@ Everything under `private/` and `data/` is gitignored and never committed.
 | `AUTH EXPIRED` while building | Normal. `nlm login`, re-run — it resumes. |
 | `nlm login` hangs forever | `uv tool upgrade notebooklm-mcp-cli`, then `nlm login --clear`. |
 | Answers cite nothing | `python3 scripts/build_pack.py --retry-empty` |
-| Replies are slow | Normal on 8B. Don't run the pack build at the same time. |
+| Replies are slow | ~25s is normal on 8B. Shorten with `COACH_MAX_TOKENS=250`, or use a smaller model. |
+| Reply cut off mid-sentence | Raise the cap: `COACH_MAX_TOKENS=700` |
+| Laptop runs hot | Generation is GPU work. Lower `COACH_MAX_TOKENS`, or `COACH_MODEL=qwen3:4b`. |
+| UI looks stale after an update | The app sends no-cache headers, but hard-refresh with `Cmd+Shift+R` if needed. |
 
 ## Options
 
 ```bash
-COACH_PORT=9000         # different port
-COACH_MODEL=llama3.1:8b # different chat model
-COACH_NUTRITION="..."   # targets via env instead of the file
+COACH_PORT=9000          # different port
+COACH_MODEL=qwen3:4b     # smaller/faster/cooler model
+COACH_MAX_TOKENS=250     # shorter replies (default 420)
+COACH_THINK=1            # restore qwen3 reasoning - better, but slower
+COACH_NUTRITION="..."    # targets via env instead of the file
+```
+
+## Starting and stopping Ollama
+
+The coach needs Ollama running. Nothing works without it - you'll see
+*"Could not reach the model"*.
+
+```bash
+ollama serve            # start (leave the terminal open)
+ollama ps               # what's loaded in memory right now
+```
+
+To stop it and free the memory (and stop the heat), quit the `ollama serve`
+process - `Ctrl+C` in its terminal, or quit the menu-bar app if you installed it
+that way. Models unload from memory on their own after ~5 minutes idle, so a
+warm laptop settles by itself between questions.
+
+A backgrounded `ollama serve &` dies when its terminal closes. To keep it alive:
+
+```bash
+nohup ollama serve > /tmp/ollama.log 2>&1 &
 ```
 
 ## Check it still works

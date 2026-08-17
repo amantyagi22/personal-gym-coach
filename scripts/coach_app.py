@@ -583,7 +583,8 @@ class Handler(BaseHTTPRequestHandler):
             raw = generate(build_messages(Handler.history, self.pack, msg, retrieval_query))
         except (urllib.error.URLError, OSError) as e:
             return self._send(200, json.dumps({"reply":
-                f"Could not reach the model ({e}). Is `ollama serve` running?"}))
+                f"Ollama isn't running, so I can't answer. Start it with `ollama serve` "
+                f"in a terminal, then send this again.\n\n({e})"}))
 
         # qwen3 emits <think> blocks; the user wants the coaching, not the monologue.
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
@@ -644,7 +645,8 @@ class Handler(BaseHTTPRequestHandler):
             emit("done", reply=reply, stripped=stripped)
         except (urllib.error.URLError, OSError) as e:
             emit("step", name="generate", status="err", detail=str(e)[:60])
-            emit("done", reply=f"Could not reach the model ({e}). Is `ollama serve` running?",
+            emit("done", reply=f"Ollama isn't running, so I can't answer. Start it with `ollama serve` "
+                f"in a terminal, then send this again.\n\n({e})",
                  stripped=[])
 
     def log_message(self, *a):

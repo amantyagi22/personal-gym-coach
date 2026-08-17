@@ -300,6 +300,28 @@ def test_stale_export_is_stated_as_fact(tmp):
     assert "no dated sessions" in app.data_freshness("nothing here")
 
 
+
+def test_checkin_trims_to_one_question(tmp):
+    """The ritual is one question at a time. Prompting alone did not hold on an 8B
+    model - it kept stacking two - so the trim is enforced in code, and only for
+    the check-in (free chat may legitimately ask more than one)."""
+    two = "The export is stale. How did training feel? Did sets reach failure?"
+    assert app.one_question_only(two) == "The export is stale. How did training feel?"
+    one = "Only one thing here. How did it feel?"
+    assert app.one_question_only(one) == one
+    assert app.one_question_only("No question at all.") == "No question at all."
+
+    srv, url, _, _ = start_server(two, tmp)
+    try:
+        _, d = call(url, "/chat", {"mode": "checkin", "message": ""})
+        assert d["reply"].count("?") == 1, d["reply"]
+        # free chat keeps both
+        _, d = call(url, "/chat", {"message": "anything"})
+        assert d["reply"].count("?") == 2, d["reply"]
+    finally:
+        srv.shutdown()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

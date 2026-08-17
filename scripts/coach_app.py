@@ -225,6 +225,16 @@ def read_head(path, chars):
     return path.read_text()[:chars] if path.exists() else ""
 
 
+def one_question_only(text):
+    """The check-in is one question at a time. qwen3:8b keeps stacking two or three
+    however the prompt is worded, so trim after the first - instructions alone don't
+    hold on an 8B model, and a wall of questions is the thing that makes it a form."""
+    parts = text.split("?")
+    if len(parts) <= 2:
+        return text
+    return parts[0] + "?"
+
+
 def data_freshness(summary):
     """State the export's age as a fact. The model has no clock, so asked to judge
     staleness it invents an answer ("only 1 day old" for a six-week-old export)."""
@@ -307,14 +317,18 @@ def generate(messages):
 
 CHECKIN_KICKOFF = """Run Aman's weekly check-in. Write at most 60 words total.
 
-First: if DATA FRESHNESS says the export is stale, say that and nothing else about the numbers - \
-old data is not this week's training. Otherwise name in ONE sentence the single most important \
+First: if DATA FRESHNESS says the export is stale, say so in one sentence with how many days old \
+it is, tell him to re-export from Strong, and then ask whether he has been training at all since \
+then - do NOT analyse the old numbers and do NOT ask what a specific session felt like, because \
+you do not know that it happened. Otherwise name in ONE sentence the single most important \
 thing in the data: a muscle below the 10-20 sets/week target, a lift flat two weeks, or a missed \
 session. Use the actual set counts shown; do not guess at them, and do not comment on the date \
 yourself - DATA FRESHNESS already states it.
 
-Then: ask exactly ONE question - the most useful thing the data cannot tell you (sleep, stress, \
-joint pain, or which sets truly got near failure). ONE question mark in your whole reply.
+Then: ask exactly ONE question - the most useful thing the data cannot tell you. Ask it in plain \
+language about how training FELT: sleep, stress, joint pain, or whether a particular set actually \
+got close to failure. Never ask him for an RPE or RIR number - he does not log those, which is \
+why you are asking in words instead. ONE question mark in your whole reply.
 
 No changes or advice yet; those come after he answers. Do not label your reply with "Step 1" or \
 "Step 2"."""
@@ -613,6 +627,8 @@ class Handler(BaseHTTPRequestHandler):
         # qwen3 emits <think> blocks; the user wants the coaching, not the monologue.
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
         reply, stripped = strip_fake_citations(raw, self.pack.titles)
+        if mode == "checkin":
+            reply = one_question_only(reply)
         Handler.history = Handler.history[-6:] + [
             {"role": "user", "content": msg}, {"role": "assistant", "content": reply}]
         if stripped:
@@ -657,6 +673,8 @@ class Handler(BaseHTTPRequestHandler):
             emit("step", name="verify", status="run", detail="checking every source title")
             raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
             reply, stripped = strip_fake_citations(raw, self.pack.titles)
+            if mode == "checkin":
+                reply = one_question_only(reply)
             cited = len(set(re.findall(r"\[\[([^\]]+)\]\]", reply)))
             emit("step", name="verify", status="warn" if stripped else "ok",
                  detail=(f"{len(stripped)} invented removed" if stripped
